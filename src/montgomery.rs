@@ -54,7 +54,7 @@ use core::{
     ops::{Mul, MulAssign},
 };
 
-use crate::constants::{APLUS2_OVER_FOUR, MONTGOMERY_A, MONTGOMERY_A_NEG};
+use crate::constants::{APLUS2_OVER_FOUR, MONTGOMERY_A, MONTGOMERY_A_NEG, self};
 use crate::edwards::{CompressedEdwardsY, EdwardsPoint};
 use crate::field::FieldElement;
 use crate::scalar::{clamp_integer, Scalar};
@@ -67,6 +67,10 @@ use subtle::{ConditionallyNegatable, ConditionallySelectable};
 
 #[cfg(feature = "zeroize")]
 use zeroize::Zeroize;
+
+
+#[cfg(any(test, feature = "rand_core"))]
+use rand_core::CryptoRngCore;
 
 /// Holds the \\(u\\)-coordinate of a point on the Montgomery form of
 /// Curve25519 or its twist.
@@ -151,6 +155,32 @@ impl MontgomeryPoint {
         Self::mul_base(&s)
     }
 
+    /// Generate a Montgomery point spanning the whole curve, useful for Elligator2 encoding
+    /// Implemented by creating a normal prime-order point and adding a small torsion factor.
+    pub fn generate_ephemeral_elligator(bytes: [u8; 32]) -> Self {
+        let high_p = EdwardsPoint::mul_base_clamped(bytes);
+        let low_p = constants::EIGHT_TORSION[(bytes[0] & 0b0000_0111) as usize];
+        let point = high_p + low_p;
+        point.to_montgomery()
+    }
+
+    /// Tries to generate an elligator point that also has a representative.
+    /// This method has randomic run-time.
+    #[cfg(any(test, feature = "rand_core"))]
+    pub fn generate_ephemeral_elligator_random<R: CryptoRngCore + ?Sized>(rng: &mut R) -> ([u8; 32], [u8; 32]) {
+        loop {
+            let mut rng_data = [0u8; 33];
+            rng.fill_bytes(&mut rng_data);
+            let tweak = rng_data[32];
+            let private = rng_data[..32].try_into().unwrap();
+
+            let point = Self::generate_ephemeral_elligator(private);
+            if let Some(repr) = point.to_elligator_representative(tweak) {
+                return (private, repr);
+            }
+        }
+    }
+
     /// View this `MontgomeryPoint` as an array of bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -207,6 +237,82 @@ impl MontgomeryPoint {
 
         CompressedEdwardsY(y_bytes).decompress()
     }
+
+    /// Perform the Elligator2 mapping to a Montgomery point.
+    ///
+    /// This will also ignore the higher 2 bits, not used by the encoding.
+    /// See <https://elligator.org/>
+    ///
+    /// # Inputs
+    ///
+    /// * `data`: The bitstream that represents the returned point in the Elligator2 mappng.
+    ///
+    /// # Return
+    ///
+    /// * `MontgomeryPoint` The point represented by `data`.
+    pub fn from_elligator_representative(data: &[u8; 32]) -> MontgomeryPoint {
+        let mut data = *data;
+        data[31] &= 0b0011_1111;
+        let r_0 = FieldElement::from_bytes(&data);
+        elligator_encode(&r_0)
+    }
+
+    /// Perform the Elligator2 mapping to a bitstream representative.
+    ///
+    /// Reverse of [from_elligator_representative](MontgomeryPoint::from_elligator_representative),
+    /// see <https://elligator.org/>.
+    ///
+    /// # Inputs
+    ///
+    /// * `tweak`: a `u8` used to randomize the elemnt given as result
+    ///           it will determine wether the element is positive/negative
+    ///           and the higher 2 bits (unused by the encoding)
+    ///
+    /// # Return
+    ///
+    /// * `Some([u8; 32])` if `self` has a Elligator2 representative (which one is decided by `tweak`)
+    ///
+    /// * `None` if `self` cannot be derived from an Elligator2 representative.
+    pub fn to_elligator_representative(&self, tweak: u8) -> Option<[u8; 32]> {
+        //let one = FieldElement::ONE;
+        let u = FieldElement::from_bytes(self.as_bytes());
+        let u_plus_A = &u + &MONTGOMERY_A;
+        let uu_plus_uA = &u * &u_plus_A;
+
+        // Condition: u != -A
+        if u == MONTGOMERY_A_NEG {
+            return None
+        }
+
+        // Condition: -2u(u+A) is a square
+        let uu2_plus_uA2 = &uu_plus_uA + &uu_plus_uA;
+        // We compute root = sqrt(-1/2u(u+A)) to speed up the calculation.
+        // This is a square if and only if -2u(u+A) is.
+        let (is_square, root) = FieldElement::sqrt_ratio_i(&FieldElement::ONE,
+                                                           &-&uu2_plus_uA2);
+        if !bool::from(is_square | root.is_zero()) {
+            return None;
+        }
+
+        // if !v_is_negative: r = sqrt(-u / 2(u + a)) = root * u
+        // if  v_is_negative: r = sqrt(-(u+A) / 2u)   = root * (u + A)
+        let add = FieldElement::conditional_select(&u, &u_plus_A, (tweak & 1).into());
+        let r = &root * &add;
+
+        // Both r and -r are valid results. Pick the nonnegative one.
+        // FieldElement::is_negative and is_negative used in elligator reference implementation differ!
+        // FieldElement checks the low bit, while elligator checks that r is in [p.+1 / 2.. p-1]
+        // since we want to follow the reference implementation, we'll use the second definition
+        let is_negative = (&r + &r).is_negative();
+        let result = FieldElement::conditional_select(&r, &-&r, is_negative);
+        let mut data = result.as_bytes();
+
+        assert_eq!(data[31] & 0b1100_0000, 0);
+        data[31] |= tweak & 0b1100_0000;
+
+        return Some(data);
+    }
+
 }
 
 /// Perform the Elligator2 mapping to a Montgomery point.
@@ -220,7 +326,7 @@ pub(crate) fn elligator_encode(r_0: &FieldElement) -> MontgomeryPoint {
     let one = FieldElement::ONE;
     let d_1 = &one + &r_0.square2(); /* 2r^2 */
 
-    let d = &MONTGOMERY_A_NEG * &(d_1.invert()); /* A/(1+2r^2) */
+    let d = &MONTGOMERY_A_NEG * &(d_1.invert()); /* -A/(1+2r^2) */
 
     let d_sq = &d.square();
     let au = &MONTGOMERY_A * &d;
@@ -416,13 +522,16 @@ impl<'a, 'b> Mul<&'b MontgomeryPoint> for &'a Scalar {
 
 #[cfg(test)]
 mod test {
+    use std::{path::PathBuf, fs};
+
     use super::*;
     use crate::constants;
 
     #[cfg(feature = "alloc")]
     use alloc::vec::Vec;
 
-    use rand_core::RngCore;
+    use rand::Rng;
+    use rand_core::{RngCore, OsRng};
 
     #[test]
     fn identity_in_different_coordinates() {
@@ -435,6 +544,82 @@ mod test {
     #[test]
     fn identity_in_different_models() {
         assert!(EdwardsPoint::identity().to_montgomery() == MontgomeryPoint::identity());
+    }
+
+    #[test]
+    fn montgomery_elligator_encode_decode() {
+        for _i in 0..4096 {
+            let mut bits = [0u8; 32];
+            OsRng.fill_bytes(&mut bits);
+            // Remove padding:
+            bits[31] &= 0b0011_1111;
+
+            let eg = MontgomeryPoint::from_elligator_representative(&bits);
+
+            // Up to four different field values may encode to a
+            // single MontgomeryPoint. Firstly, the MontgomeryPoint
+            // loses the v-coordinate, so it may represent two
+            // different curve points, (u, v) and (u, -v). The
+            // elligator_decode function is given a sign argument to
+            // indicate which one is meant.
+            //
+            // Second, for each curve point (except zero), two
+            // distinct field elements encode to it, r and -r. The
+            // elligator_decode function returns the nonnegative one.
+            //
+            // We check here that one of these four values is equal to
+            // the original input to elligator_encode.
+
+            let mut found = false;
+
+            for i in 0..=1 {
+                let decoded = eg.to_elligator_representative(i)
+                    .expect("Elligator decode failed");
+                let fe = FieldElement::from_bytes(&bits);
+                let dec = FieldElement::from_bytes(&decoded);
+                for j in &[fe, -&fe] {
+                    found |= dec == *j;
+                }
+            }
+
+            assert!(found);
+        }
+    }
+
+    #[test]
+    fn montgomery_elligator_decode_encode() {
+        let mut csprng = OsRng;
+        for _i in 0..100 {
+            let s: Scalar = Scalar::random(&mut csprng);
+            let p_edwards = EdwardsPoint::mul_base(&s);
+            let p_montgomery: MontgomeryPoint = p_edwards.to_montgomery();
+            let tweak: u8 = csprng.gen();
+
+            let result = p_montgomery.to_elligator_representative(tweak);
+
+            if let Some(fe) = result {
+                let encoded = MontgomeryPoint::from_elligator_representative(&fe);
+
+                assert_eq!(encoded, p_montgomery);
+            }
+        }
+    }
+
+    #[test]
+    fn montgomery_elligator_lifecycle() {
+        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+        for _i in 0..10 {
+            let (a_priv_key, a_repr) = MontgomeryPoint::generate_ephemeral_elligator_random(&mut rng);
+            let (b_priv_key, b_repr) = MontgomeryPoint::generate_ephemeral_elligator_random(&mut rng);
+
+            // A: b.send(a_repr)
+            // B: a.send(b_repr)
+            let a_secret = MontgomeryPoint::from_elligator_representative(&b_repr).mul_clamped(a_priv_key);
+            let b_secret = MontgomeryPoint::from_elligator_representative(&a_repr).mul_clamped(b_priv_key);
+
+            assert_eq!(a_secret, b_secret);
+            eprint!(".");
+        }
     }
 
     #[test]
@@ -570,5 +755,75 @@ mod test {
         let fe = FieldElement::from_bytes(&zero);
         let eg = elligator_encode(&fe);
         assert_eq!(eg.to_bytes(), zero);
+    }
+
+    #[test]
+    fn montgomery_elligator_test_vec() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("vendor/curve25519_direct.vec");
+        let test_file = fs::read_to_string(path).expect("Failed reading test vec");
+        let test_lines = test_file.split('\n');
+        let mut test_lines_it = test_lines.into_iter();
+        let mut reprs = vec![];
+        let mut u_coords = vec![];
+        loop {
+            let (repr, u, v, empty) = (test_lines_it.next(), test_lines_it.next(), test_lines_it.next(), test_lines_it.next());
+            if let (Some(reprt), Some(ut), _, _) = (repr, u, v, empty) {
+                let mut r = [0u8; 32];
+                let mut u = [0u8; 32];
+                hex::decode_to_slice(reprt.strip_suffix(":").unwrap(), &mut r).expect("Invalid repr format");
+                hex::decode_to_slice(ut.strip_suffix(":").unwrap(), &mut u).expect("Invalid u-cord format");
+                reprs.push(r);
+                u_coords.push(u);
+            } else {
+                break
+            }
+        }
+
+        for (r, u) in reprs.iter().zip(u_coords.iter()) {
+            let fe = FieldElement::from_bytes(&r);
+            let eg = elligator_encode(&fe);
+            assert_eq!(eg.to_bytes(), *u);
+        }
+    }
+
+    #[test]
+    fn montgomery_elligator_inv_test_vec() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("vendor/curve25519_inverse.vec");
+        let test_file = fs::read_to_string(path).expect("Failed reading test vec");
+        let test_lines = test_file.split('\n');
+        let mut test_lines_it = test_lines.into_iter();
+        let mut u_coords = vec![];
+        let mut signs = vec![];
+        let mut reprs = vec![];
+        loop {
+            let (u, sign, _has_repr, repr, _empty) = (test_lines_it.next(), test_lines_it.next(), test_lines_it.next(), test_lines_it.next(), test_lines_it.next());
+            if let (Some(ut), Some(signt), Some(reprt)) = (u, sign, repr) {
+
+                let mut u = [0u8; 32];
+                let sign = signt == "01:";
+
+                hex::decode_to_slice(ut.strip_suffix(":").unwrap(), &mut u).expect("Invalid u-cord format");
+                let r = if reprt.len() == 1 {
+                    None
+                } else {
+                    let mut r = [0u8; 32];
+                    hex::decode_to_slice(reprt.strip_suffix(":").unwrap(), &mut r).expect("Invalid repr format");
+                    Some(r)
+                };
+                u_coords.push(u);
+                signs.push(sign);
+                reprs.push(r);
+            } else {
+                break
+            }
+        }
+
+        for ((u, sign), r) in u_coords.iter().zip(signs.iter()).zip(reprs.iter()) {
+            let data = MontgomeryPoint(*u).to_elligator_representative(*sign as u8);
+
+            assert_eq!(data, *r);
+        }
     }
 }
